@@ -1,0 +1,814 @@
+name: Construire l'APK Transcripteur
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+env:
+  SHERPA_VERSION: v1.13.8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Générer le projet Android
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "fr.transcripteur"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "fr.transcripteur"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+
+              androidResources { noCompress.addAll(listOf("onnx", "txt")) }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              lint { checkReleaseBuilds = false; abortOnError = false }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Transcripteur"
+                  android:icon="@android:drawable/ic_btn_speak_now"
+                  android:largeHeap="true"
+                  android:extractNativeLibs="true"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="audio/*" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:scheme="content" android:mimeType="audio/*" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/java/fr/transcripteur/AudioDecoder.kt')"
+          cat > 'app/src/main/java/fr/transcripteur/AudioDecoder.kt' <<'EOF_FILE'
+          package fr.transcripteur
+
+          import android.content.Context
+          import android.media.AudioFormat
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.net.Uri
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          /** Décode n'importe quel audio lisible par Android (m4a/AAC, mp3, ogg, wav…) en PCM mono 16 kHz. */
+          object AudioDecoder {
+
+              private class FloatBuilder(initial: Int) {
+                  var data = FloatArray(initial)
+                  var size = 0
+                  fun add(v: Float) {
+                      if (size == data.size) data = data.copyOf(data.size * 2)
+                      data[size++] = v
+                  }
+                  fun toArray(): FloatArray = data.copyOf(size)
+              }
+
+              fun decode(ctx: Context, uri: Uri, targetRate: Int, onProgress: (Float) -> Unit): FloatArray {
+                  val extractor = MediaExtractor()
+                  extractor.setDataSource(ctx, uri, null)
+
+                  var track = -1
+                  for (i in 0 until extractor.trackCount) {
+                      val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                      if (mime.startsWith("audio/")) { track = i; break }
+                  }
+                  require(track >= 0) { "Aucune piste audio trouvée dans ce fichier." }
+
+                  extractor.selectTrack(track)
+                  val format = extractor.getTrackFormat(track)
+                  val mime = format.getString(MediaFormat.KEY_MIME)!!
+                  val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
+                  var sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                  var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                  var encoding = AudioFormat.ENCODING_PCM_16BIT
+
+                  val codec = MediaCodec.createDecoderByType(mime)
+                  codec.configure(format, null, null, 0)
+                  codec.start()
+
+                  val estimate = if (durationUs > 0) (durationUs / 1_000_000.0 * sampleRate).toInt() + 16000 else 16000 * 60
+                  val out = FloatBuilder(estimate.coerceAtLeast(16000))
+                  val info = MediaCodec.BufferInfo()
+                  var inputDone = false
+                  var outputDone = false
+                  var lastReported = -1
+
+                  try {
+                      while (!outputDone) {
+                          if (!inputDone) {
+                              val inIdx = codec.dequeueInputBuffer(10_000)
+                              if (inIdx >= 0) {
+                                  val buf = codec.getInputBuffer(inIdx)!!
+                                  val n = extractor.readSampleData(buf, 0)
+                                  if (n < 0) {
+                                      codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      inputDone = true
+                                  } else {
+                                      val t = extractor.sampleTime
+                                      codec.queueInputBuffer(inIdx, 0, n, t, 0)
+                                      extractor.advance()
+                                      if (durationUs > 0) {
+                                          val p = (100 * t / durationUs).toInt()
+                                          if (p != lastReported) { lastReported = p; onProgress(p / 100f) }
+                                      }
+                                  }
+                              }
+                          }
+
+                          val outIdx = codec.dequeueOutputBuffer(info, 10_000)
+                          if (outIdx >= 0) {
+                              val buf = codec.getOutputBuffer(outIdx)!!
+                              buf.position(info.offset)
+                              buf.limit(info.offset + info.size)
+                              val b = buf.slice().order(ByteOrder.nativeOrder())
+                              if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                                  val fb = b.asFloatBuffer()
+                                  val frames = fb.remaining() / channels
+                                  for (f in 0 until frames) {
+                                      var s = 0f
+                                      for (c in 0 until channels) s += fb.get()
+                                      out.add(s / channels)
+                                  }
+                              } else {
+                                  val sb = b.asShortBuffer()
+                                  val frames = sb.remaining() / channels
+                                  for (f in 0 until frames) {
+                                      var s = 0f
+                                      for (c in 0 until channels) s += sb.get()
+                                      out.add(s / channels / 32768f)
+                                  }
+                              }
+                              codec.releaseOutputBuffer(outIdx, false)
+                              if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                          } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              val f = codec.outputFormat
+                              sampleRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                              channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                              if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) encoding = f.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                          }
+                      }
+                  } finally {
+                      codec.stop(); codec.release(); extractor.release()
+                  }
+
+                  val mono = out.toArray()
+                  return resample(mono, sampleRate, targetRate)
+              }
+
+              /** Rééchantillonnage par sinc fenêtré (Hann), noyau tabulé pour la vitesse. */
+              fun resample(x: FloatArray, from: Int, to: Int): FloatArray {
+                  if (from == to || x.isEmpty()) return x
+                  val ratio = from.toDouble() / to
+                  val cut = 0.95 * (if (ratio > 1.0) 1.0 / ratio else 1.0)
+                  val zeroCrossings = 8
+                  val width = (zeroCrossings / cut).toInt() + 1
+                  val res = 256
+                  val table = FloatArray((width + 1) * res + 1) { k ->
+                      val d = k.toDouble() / res
+                      val xx = d * cut
+                      val s = if (xx < 1e-9) 1.0 else sin(PI * xx) / (PI * xx)
+                      val w = if (d >= width) 0.0 else 0.5 + 0.5 * cos(PI * d / width)
+                      (s * w * cut).toFloat()
+                  }
+                  val outLen = (x.size / ratio).toInt()
+                  val y = FloatArray(outLen)
+                  for (i in 0 until outLen) {
+                      val t = i * ratio
+                      val c = t.toInt()
+                      var acc = 0f
+                      val lo = maxOf(0, c - width + 1)
+                      val hi = minOf(x.size - 1, c + width)
+                      for (j in lo..hi) {
+                          val k = (abs(t - j) * res).toInt()
+                          if (k < table.size) acc += x[j] * table[k]
+                      }
+                      y[i] = acc
+                  }
+                  return y
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/java/fr/transcripteur/MainActivity.kt')"
+          cat > 'app/src/main/java/fr/transcripteur/MainActivity.kt' <<'EOF_FILE'
+          package fr.transcripteur
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.view.WindowManager
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ProgressBar
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.view.ViewCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : AppCompatActivity() {
+
+              private val languages = listOf(
+                  "Français" to "fr", "Anglais" to "en", "Espagnol" to "es", "Allemand" to "de",
+                  "Italien" to "it", "Portugais" to "pt", "Arabe" to "ar", "Détection automatique" to "",
+              )
+
+              private var audioUri: Uri? = null
+              private var audioName = "transcription"
+              private var transcript = ""
+              private var busy = false
+
+              private lateinit var btnPick: Button
+              private lateinit var btnRun: Button
+              private lateinit var btnCopy: Button
+              private lateinit var btnShare: Button
+              private lateinit var btnSave: Button
+              private lateinit var txtFile: TextView
+              private lateinit var txtStatus: TextView
+              private lateinit var txtResult: TextView
+              private lateinit var spLang: Spinner
+              private lateinit var edSpeakers: EditText
+              private lateinit var progress: ProgressBar
+
+              private val pickAudio = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) setAudio(uri)
+              }
+
+              private val saveTxt = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+                  if (uri != null) {
+                      try {
+                          contentResolver.openOutputStream(uri)?.use { it.write(transcript.toByteArray(Charsets.UTF_8)) }
+                          toast("Fichier enregistré")
+                      } catch (e: Exception) {
+                          toast("Erreur d'enregistrement : ${e.message}")
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  val root = findViewById<android.view.View>(R.id.root)
+                  val pad = root.paddingLeft
+                  ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+                      val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+                      v.setPadding(pad + bars.left, pad + bars.top, pad + bars.right, pad + bars.bottom)
+                      insets
+                  }
+
+                  btnPick = findViewById(R.id.btnPick)
+                  btnRun = findViewById(R.id.btnRun)
+                  btnCopy = findViewById(R.id.btnCopy)
+                  btnShare = findViewById(R.id.btnShare)
+                  btnSave = findViewById(R.id.btnSave)
+                  txtFile = findViewById(R.id.txtFile)
+                  txtStatus = findViewById(R.id.txtStatus)
+                  txtResult = findViewById(R.id.txtResult)
+                  spLang = findViewById(R.id.spLang)
+                  edSpeakers = findViewById(R.id.edSpeakers)
+                  progress = findViewById(R.id.progress)
+
+                  spLang.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, languages.map { it.first })
+
+                  btnPick.setOnClickListener { pickAudio.launch(arrayOf("audio/*")) }
+                  btnRun.setOnClickListener { startTranscription() }
+                  btnCopy.setOnClickListener {
+                      val cm = getSystemService(ClipboardManager::class.java)
+                      cm?.setPrimaryClip(ClipData.newPlainText("Transcription", transcript))
+                      toast("Copié")
+                  }
+                  btnShare.setOnClickListener {
+                      val send = Intent(Intent.ACTION_SEND).apply {
+                          type = "text/plain"
+                          putExtra(Intent.EXTRA_SUBJECT, "Transcription – $audioName")
+                          putExtra(Intent.EXTRA_TEXT, transcript)
+                      }
+                      startActivity(Intent.createChooser(send, "Partager la transcription"))
+                  }
+                  btnSave.setOnClickListener { saveTxt.launch("$audioName.txt") }
+
+                  handleIntent(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleIntent(intent)
+              }
+
+              private fun handleIntent(intent: Intent?) {
+                  if (intent == null || busy) return
+                  val uri: Uri? = when (intent.action) {
+                      Intent.ACTION_SEND -> streamUri(intent)
+                      Intent.ACTION_VIEW -> intent.data
+                      else -> null
+                  }
+                  if (uri != null) setAudio(uri)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun streamUri(intent: Intent): Uri? =
+                  if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                  else intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+
+              private fun setAudio(uri: Uri) {
+                  audioUri = uri
+                  var name = uri.lastPathSegment ?: "audio"
+                  try {
+                      contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                          if (c.moveToFirst()) name = c.getString(0) ?: name
+                      }
+                  } catch (_: Exception) { }
+                  audioName = name.substringBeforeLast('.')
+                  txtFile.text = name
+                  btnRun.isEnabled = !busy
+              }
+
+              private fun startTranscription() {
+                  val uri = audioUri ?: return
+                  val lang = languages[spLang.selectedItemPosition].second
+                  val n = edSpeakers.text.toString().toIntOrNull() ?: 0
+
+                  busy = true
+                  setButtons(false)
+                  transcript = ""
+                  txtResult.text = ""
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  lifecycleScope.launch {
+                      try {
+                          val result = withContext(Dispatchers.Default) {
+                              Transcriber.run(
+                                  this@MainActivity, uri, lang, n,
+                                  status = { msg, p -> runOnUiThread { txtStatus.text = msg; progress.progress = p } },
+                                  partial = { txt -> runOnUiThread { txtResult.text = txt } },
+                              )
+                          }
+                          transcript = result
+                          txtResult.text = result
+                      } catch (t: Throwable) {
+                          txtStatus.text = "Erreur : ${t.message ?: t.javaClass.simpleName}"
+                          if (t is OutOfMemoryError) txtStatus.append("\nFichier trop long pour la mémoire du téléphone : découpez-le.")
+                      } finally {
+                          busy = false
+                          window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                          setButtons(true)
+                      }
+                  }
+              }
+
+              private fun setButtons(enabled: Boolean) {
+                  btnPick.isEnabled = enabled
+                  btnRun.isEnabled = enabled && audioUri != null
+                  val has = enabled && transcript.isNotBlank()
+                  btnCopy.isEnabled = has
+                  btnShare.isEnabled = has
+                  btnSave.isEnabled = has
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/java/fr/transcripteur/Transcriber.kt')"
+          cat > 'app/src/main/java/fr/transcripteur/Transcriber.kt' <<'EOF_FILE'
+          package fr.transcripteur
+
+          import android.content.Context
+          import android.net.Uri
+          import com.k2fsa.sherpa.onnx.FastClusteringConfig
+          import com.k2fsa.sherpa.onnx.FeatureConfig
+          import com.k2fsa.sherpa.onnx.OfflineModelConfig
+          import com.k2fsa.sherpa.onnx.OfflineRecognizer
+          import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+          import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarization
+          import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationConfig
+          import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationModelConfig
+          import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
+          import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
+          import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
+          import kotlin.math.sqrt
+
+          /**
+           * Pipeline 100 % hors ligne :
+           * 1) décodage audio -> 16 kHz mono
+           * 2) diarisation (pyannote segmentation 3.0 + embeddings WeSpeaker + clustering)
+           * 3) transcription de chaque tour de parole avec Whisper (base, int8)
+           */
+          object Transcriber {
+              const val SR = 16000
+              private const val MAX_CHUNK_S = 28f   // Whisper traite au plus 30 s par passe
+
+              private class Turn(val start: Float, var end: Float, val speaker: Int)
+
+              fun run(
+                  ctx: Context,
+                  uri: Uri,
+                  language: String,
+                  numSpeakers: Int,      // <= 0 : détection automatique
+                  status: (String, Int) -> Unit,
+                  partial: (String) -> Unit,
+              ): String {
+                  status("Décodage de l'audio…", 0)
+                  val samples = AudioDecoder.decode(ctx, uri, SR) { p -> status("Décodage de l'audio…", (p * 10).toInt()) }
+                  require(samples.size > SR / 2) { "Fichier audio vide ou trop court." }
+                  val totalSec = samples.size.toFloat() / SR
+
+                  status("Chargement du modèle d'intervenants…", 10)
+                  val sdConfig = OfflineSpeakerDiarizationConfig(
+                      segmentation = OfflineSpeakerSegmentationModelConfig(
+                          pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = "seg/model.onnx"),
+                          numThreads = 2,
+                      ),
+                      embedding = SpeakerEmbeddingExtractorConfig(model = "spk/embedding.onnx", numThreads = 2),
+                      clustering = FastClusteringConfig(numClusters = if (numSpeakers > 0) numSpeakers else -1, threshold = 0.5f),
+                      minDurationOn = 0.3f,
+                      minDurationOff = 0.5f,
+                  )
+                  val sd = OfflineSpeakerDiarization(ctx.assets, sdConfig)
+                  val segments = try {
+                      sd.processWithCallback(samples, { done, total, _ ->
+                          val p = if (total > 0) 10 + 30 * done / total else 10
+                          status("Identification des intervenants… ($done/$total)", p)
+                          0
+                      })
+                  } finally {
+                      sd.release()
+                  }
+
+                  // Regroupe les segments consécutifs d'un même intervenant en "tours de parole".
+                  val turns = ArrayList<Turn>()
+                  for (s in segments.sortedBy { it.start }) {
+                      val last = turns.lastOrNull()
+                      if (last != null && last.speaker == s.speaker && s.start - last.end < 1.5f) {
+                          if (s.end > last.end) last.end = s.end
+                      } else {
+                          turns.add(Turn(s.start, s.end, s.speaker))
+                      }
+                  }
+                  if (turns.isEmpty()) turns.add(Turn(0f, totalSec, 0))
+
+                  // Numérote les intervenants dans l'ordre d'apparition.
+                  val names = LinkedHashMap<Int, Int>()
+                  for (t in turns) if (t.speaker !in names) names[t.speaker] = names.size + 1
+
+                  status("Chargement de Whisper…", 40)
+                  val recConfig = OfflineRecognizerConfig(
+                      featConfig = FeatureConfig(sampleRate = SR, featureDim = 80),
+                      modelConfig = OfflineModelConfig(
+                          whisper = OfflineWhisperModelConfig(
+                              encoder = "whisper/base-encoder.int8.onnx",
+                              decoder = "whisper/base-decoder.int8.onnx",
+                              language = language,
+                              task = "transcribe",
+                          ),
+                          tokens = "whisper/base-tokens.txt",
+                          modelType = "whisper",
+                          numThreads = 4,
+                      ),
+                  )
+                  val rec = OfflineRecognizer(ctx.assets, recConfig)
+
+                  val sb = StringBuilder()
+                  sb.append("Transcription — ${names.size} intervenant(s) détecté(s) — durée ${fmt(totalSec)}\n\n")
+                  try {
+                      for ((i, t) in turns.withIndex()) {
+                          val pct = 40 + 60 * i / turns.size
+                          status("Transcription… tour ${i + 1}/${turns.size}", pct)
+                          val text = transcribeRange(rec, samples, t.start, t.end)
+                          if (text.isBlank()) continue
+                          sb.append("[${fmt(t.start)} → ${fmt(t.end)}] Intervenant ${names[t.speaker]}\n")
+                          sb.append(text).append("\n\n")
+                          partial(sb.toString())
+                      }
+                  } finally {
+                      rec.release()
+                  }
+                  status("Terminé ✔", 100)
+                  return sb.toString().trimEnd() + "\n"
+              }
+
+              /** Transcrit un intervalle en le découpant (sur des silences) en morceaux de moins de 28 s. */
+              private fun transcribeRange(rec: OfflineRecognizer, x: FloatArray, startS: Float, endS: Float): String {
+                  var a = (startS * SR).toInt().coerceIn(0, x.size)
+                  val b = (endS * SR).toInt().coerceIn(0, x.size)
+                  val parts = ArrayList<String>()
+                  while (b - a > (0.3f * SR)) {
+                      var cut = b
+                      if (b - a > MAX_CHUNK_S * SR) cut = quietestPoint(x, a + 18 * SR, a + (MAX_CHUNK_S * SR).toInt())
+                      val chunk = x.copyOfRange(a, cut)
+                      val stream = rec.createStream()
+                      try {
+                          stream.acceptWaveform(chunk, SR)
+                          rec.decode(stream)
+                          val txt = rec.getResult(stream).text.trim()
+                          if (txt.isNotEmpty()) parts.add(txt)
+                      } finally {
+                          stream.release()
+                      }
+                      a = cut
+                  }
+                  return parts.joinToString(" ")
+              }
+
+              /** Point de plus faible énergie (fenêtres de 100 ms) entre lo et hi. */
+              private fun quietestPoint(x: FloatArray, lo: Int, hi: Int): Int {
+                  val win = SR / 10
+                  var best = hi
+                  var bestE = Double.MAX_VALUE
+                  var p = lo
+                  while (p + win <= hi && p + win <= x.size) {
+                      var e = 0.0
+                      for (k in p until p + win) e += x[k] * x[k]
+                      val rms = sqrt(e / win)
+                      if (rms < bestE) { bestE = rms; best = p + win / 2 }
+                      p += win / 2
+                  }
+                  return best
+              }
+
+              fun fmt(s: Float): String {
+                  val t = s.toInt()
+                  return "%02d:%02d:%02d".format(t / 3600, (t / 60) % 60, t % 60)
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/layout/activity_main.xml')"
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="Transcripteur hors ligne"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+
+              <Button
+                  android:id="@+id/btnPick"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:text="Choisir un fichier audio (m4a…)" />
+
+              <TextView
+                  android:id="@+id/txtFile"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Aucun fichier sélectionné" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Langue : " />
+
+                  <Spinner
+                      android:id="@+id/spLang"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1" />
+              </LinearLayout>
+
+              <EditText
+                  android:id="@+id/edSpeakers"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:hint="Nombre d'intervenants (vide = automatique)"
+                  android:inputType="number"
+                  android:maxLength="2" />
+
+              <Button
+                  android:id="@+id/btnRun"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:enabled="false"
+                  android:text="Transcrire" />
+
+              <ProgressBar
+                  android:id="@+id/progress"
+                  style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:max="100" />
+
+              <TextView
+                  android:id="@+id/txtStatus"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal">
+
+                  <Button
+                      android:id="@+id/btnCopy"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:enabled="false"
+                      android:text="Copier" />
+
+                  <Button
+                      android:id="@+id/btnShare"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp"
+                      android:layout_weight="1"
+                      android:enabled="false"
+                      android:text="Partager" />
+
+                  <Button
+                      android:id="@+id/btnSave"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp"
+                      android:layout_weight="1"
+                      android:enabled="false"
+                      android:text=".txt" />
+              </LinearLayout>
+
+              <ScrollView
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="8dp"
+                  android:layout_weight="1">
+
+                  <TextView
+                      android:id="@+id/txtResult"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textIsSelectable="true"
+                      android:textSize="15sp" />
+              </ScrollView>
+          </LinearLayout>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar" />
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Transcripteur"
+          include(":app")
+          EOF_FILE
+
+
+      - name: Bibliothèque sherpa-onnx (moteur hors ligne)
+        run: |
+          set -e
+          git clone -q --depth 1 --branch "$SHERPA_VERSION" --filter=blob:none --sparse https://github.com/k2-fsa/sherpa-onnx.git /tmp/so
+          (cd /tmp/so && git sparse-checkout set sherpa-onnx/kotlin-api)
+          DST=app/src/main/java/com/k2fsa/sherpa/onnx
+          mkdir -p "$DST"
+          for f in OfflineRecognizer OfflineStream OnlineStream FeatureConfig HomophoneReplacerConfig QnnConfig OfflineSpeakerDiarization Speaker SpeakerEmbeddingExtractorConfig; do
+            cp "/tmp/so/sherpa-onnx/kotlin-api/$f.kt" "$DST/"
+          done
+          curl -sSfL "https://github.com/k2-fsa/sherpa-onnx/releases/download/$SHERPA_VERSION/sherpa-onnx-$SHERPA_VERSION-android.tar.bz2" | tar xjf - -C /tmp
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so app/src/main/jniLibs/arm64-v8a/
+
+      - name: Modèles (Whisper base, pyannote, WeSpeaker)
+        run: |
+          set -e
+          A=app/src/main/assets
+          mkdir -p $A/whisper $A/seg $A/spk
+          R=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          curl -sSfL $R/asr-models/sherpa-onnx-whisper-base.tar.bz2 | tar xjf - -C /tmp
+          cp /tmp/sherpa-onnx-whisper-base/base-encoder.int8.onnx /tmp/sherpa-onnx-whisper-base/base-decoder.int8.onnx /tmp/sherpa-onnx-whisper-base/base-tokens.txt $A/whisper/
+          curl -sSfL $R/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xjf - -C /tmp
+          cp /tmp/sherpa-onnx-pyannote-segmentation-3-0/model.onnx $A/seg/model.onnx
+          curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+          du -sh $A/*
+
+      - name: Compiler l'APK
+        run: gradle --no-daemon assembleRelease
+
+      - name: Publier l'APK (onglet Releases)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk Transcripteur.apk
+          gh release create "build-${{ github.run_number }}" Transcripteur.apk \
+            --title "Transcripteur – build ${{ github.run_number }}" \
+            --notes "APK à installer sur Android (arm64). Transcription + séparation des intervenants, 100 % hors ligne."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Transcripteur-apk
+          path: Transcripteur.apk
