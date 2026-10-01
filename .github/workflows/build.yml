@@ -475,6 +475,20 @@ jobs:
            * 2) diarisation (pyannote segmentation 3.0 + embeddings WeSpeaker + clustering)
            * 3) transcription de chaque tour de parole avec Whisper (base, int8)
            */
+          /**
+           * Rappel de progression appelé par le code natif.
+           * IMPORTANT : ce doit être une vraie classe et non un lambda. Le code natif cherche une
+           * méthode invoke(int, int, long) -> Integer ; Kotlin 2 compile les lambdas autrement
+           * (invokedynamic), la méthode est introuvable et l'application est tuée net.
+           */
+          class DiarizationProgress(private val status: (String, Int) -> Unit) : (Int, Int, Long) -> Int {
+              override fun invoke(done: Int, total: Int, arg: Long): Int {
+                  val p = if (total > 0) 10 + 30 * done / total else 10
+                  status("Identification des intervenants… ($done/$total)", p)
+                  return 0
+              }
+          }
+
           object Transcriber {
               const val SR = 16000
               private const val MAX_CHUNK_S = 28f   // Whisper traite au plus 30 s par passe
@@ -507,11 +521,7 @@ jobs:
                   )
                   val sd = OfflineSpeakerDiarization(ctx.assets, sdConfig)
                   val segments = try {
-                      sd.processWithCallback(samples, { done, total, _ ->
-                          val p = if (total > 0) 10 + 30 * done / total else 10
-                          status("Identification des intervenants… ($done/$total)", p)
-                          0
-                      })
+                      sd.processWithCallback(samples, DiarizationProgress(status))
                   } finally {
                       sd.release()
                   }
@@ -806,7 +816,7 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk Transcripteur.apk
           gh release create "build-${{ github.run_number }}" Transcripteur.apk \
             --title "Transcripteur – build ${{ github.run_number }}" \
-            --notes "APK à installer sur Android (arm64). Transcription + séparation des intervenants, 100 % hors ligne."
+            --notes "Désinstallez l'ancienne version avant d'installer celle-ci. APK à installer sur Android (arm64). Transcription + séparation des intervenants, 100 % hors ligne."
 
       - uses: actions/upload-artifact@v4
         with:
