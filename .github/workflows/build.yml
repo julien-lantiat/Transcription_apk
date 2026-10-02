@@ -271,9 +271,11 @@ jobs:
           import android.os.Bundle
           import android.provider.OpenableColumns
           import android.view.WindowManager
+          import android.widget.ArrayAdapter
           import android.widget.Button
           import android.widget.EditText
           import android.widget.ProgressBar
+          import android.widget.Spinner
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
@@ -286,6 +288,16 @@ jobs:
           import kotlinx.coroutines.withContext
 
           class MainActivity : AppCompatActivity() {
+
+              // Langues prises en charge par Canary 180M Flash
+              private val languages = listOf("Français" to "fr", "Anglais" to "en", "Espagnol" to "es", "Allemand" to "de")
+
+              // Seuil de clustering : plus petit = sépare davantage les voix
+              private val separations = listOf(
+                  "Normale" to 0.45f,
+                  "Forte (voix proches)" to 0.30f,
+                  "Faible (trop d'intervenants)" to 0.60f,
+              )
 
               private var audioUri: Uri? = null
               private var audioName = "transcription"
@@ -301,6 +313,9 @@ jobs:
               private lateinit var txtStatus: TextView
               private lateinit var txtResult: TextView
               private lateinit var edSpeakers: EditText
+              private lateinit var edWindow: EditText
+              private lateinit var spLang: Spinner
+              private lateinit var spSep: Spinner
               private lateinit var progress: ProgressBar
 
               private val pickAudio = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -339,6 +354,11 @@ jobs:
                   txtStatus = findViewById(R.id.txtStatus)
                   txtResult = findViewById(R.id.txtResult)
                   edSpeakers = findViewById(R.id.edSpeakers)
+                  edWindow = findViewById(R.id.edWindow)
+                  spLang = findViewById(R.id.spLang)
+                  spSep = findViewById(R.id.spSep)
+                  spLang.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, languages.map { it.first })
+                  spSep.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, separations.map { it.first })
                   progress = findViewById(R.id.progress)
 
                   btnPick.setOnClickListener { pickAudio.launch(arrayOf("audio/*")) }
@@ -397,6 +417,14 @@ jobs:
               private fun startTranscription() {
                   val uri = audioUri ?: return
                   val n = edSpeakers.text.toString().toIntOrNull() ?: 0
+                  val w = (edWindow.text.toString().toFloatOrNull() ?: 28f).coerceIn(5f, 40f)
+                  edWindow.setText(w.toInt().toString())
+                  val params = Params(
+                      language = languages[spLang.selectedItemPosition].second,
+                      numSpeakers = n,
+                      threshold = separations[spSep.selectedItemPosition].second,
+                      windowSec = w,
+                  )
 
                   busy = true
                   setButtons(false)
@@ -408,7 +436,7 @@ jobs:
                       try {
                           val result = withContext(Dispatchers.Default) {
                               Transcriber.run(
-                                  this@MainActivity, uri, n,
+                                  this@MainActivity, uri, params,
                                   status = { msg, p -> runOnUiThread { txtStatus.text = msg; progress.progress = p } },
                                   partial = { txt -> runOnUiThread { txtResult.text = txt } },
                               )
@@ -446,6 +474,7 @@ jobs:
           import android.net.Uri
           import com.k2fsa.sherpa.onnx.FastClusteringConfig
           import com.k2fsa.sherpa.onnx.FeatureConfig
+          import com.k2fsa.sherpa.onnx.OfflineCanaryModelConfig
           import com.k2fsa.sherpa.onnx.OfflineModelConfig
           import com.k2fsa.sherpa.onnx.OfflineRecognizer
           import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
@@ -453,58 +482,79 @@ jobs:
           import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationConfig
           import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationModelConfig
           import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
-          import com.k2fsa.sherpa.onnx.OfflineTransducerModelConfig
+          import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
           import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
+          import kotlin.math.ceil
+          import kotlin.math.max
+          import kotlin.math.min
           import kotlin.math.sqrt
 
           /**
-           * Pipeline 100 % hors ligne :
-           * 1) décodage audio -> 16 kHz mono
-           * 2) diarisation (pyannote segmentation 3.0 + embeddings WeSpeaker + clustering)
-           * 3) transcription de chaque tour de parole avec NVIDIA Parakeet TDT 0.6B v3 (int8, 25 langues)
-           */
-          /**
            * Rappel de progression appelé par le code natif.
-           * IMPORTANT : ce doit être une vraie classe et non un lambda. Le code natif cherche une
-           * méthode invoke(int, int, long) -> Integer ; Kotlin 2 compile les lambdas autrement
-           * (invokedynamic), la méthode est introuvable et l'application est tuée net.
+           * Doit être une vraie classe (pas un lambda) : le code natif cherche invoke(int, int, long) -> Integer.
            */
           class DiarizationProgress(private val status: (String, Int) -> Unit) : (Int, Int, Long) -> Int {
               override fun invoke(done: Int, total: Int, arg: Long): Int {
-                  val p = if (total > 0) 10 + 30 * done / total else 10
+                  val p = if (total > 0) 10 + 25 * done / total else 10
                   status("Identification des intervenants… ($done/$total)", p)
                   return 0
               }
           }
 
+          data class Params(
+              val language: String,        // fr, en, es, de (Canary)
+              val numSpeakers: Int,        // <= 0 : automatique
+              val threshold: Float,        // seuil de clustering (plus petit = plus d'intervenants)
+              val windowSec: Float,        // fenêtre max de transcription
+          )
+
+          /**
+           * Pipeline 100 % hors ligne :
+           * 1) décodage audio -> 16 kHz mono
+           * 2) diarisation pyannote 3.0 + TitaNet-Large
+           * 3) chronologie sans chevauchement : un instant = un seul intervenant
+           * 4) ré-attribution de chaque tour par empreinte vocale (centroïdes)
+           * 5) transcription de chaque tour avec NVIDIA Canary 180M Flash, langue imposée
+           */
           object Transcriber {
               const val SR = 16000
-              private const val MAX_CHUNK_S = 40f   // morceaux de 40 s max, coupés sur un silence
+              private const val FRAME = 0.01f          // 10 ms
+              private const val MERGE_GAP = 0.6f       // silence max pour fusionner deux tours du même intervenant
+              private const val MIN_TURN = 0.3f        // tours plus courts ignorés (bruits)
+              private const val MIN_EMB = 1.0f         // durée min pour calculer une empreinte fiable
 
-              private class Turn(val start: Float, var end: Float, val speaker: Int)
+              private class Turn(var start: Float, var end: Float, var speaker: Int) {
+                  val dur get() = end - start
+                  var emb: FloatArray? = null
+              }
 
               fun run(
                   ctx: Context,
                   uri: Uri,
-                  numSpeakers: Int,      // <= 0 : détection automatique
+                  p: Params,
                   status: (String, Int) -> Unit,
                   partial: (String) -> Unit,
               ): String {
                   status("Décodage de l'audio…", 0)
-                  val samples = AudioDecoder.decode(ctx, uri, SR) { p -> status("Décodage de l'audio…", (p * 10).toInt()) }
+                  val samples = AudioDecoder.decode(ctx, uri, SR) { f -> status("Décodage de l'audio…", (f * 10).toInt()) }
                   require(samples.size > SR / 2) { "Fichier audio vide ou trop court." }
                   val totalSec = samples.size.toFloat() / SR
 
+                  // ---------- 1. Diarisation ----------
                   status("Chargement du modèle d'intervenants…", 10)
+                  val embCfg = SpeakerEmbeddingExtractorConfig(model = "spk/embedding.onnx", numThreads = 2)
                   val sdConfig = OfflineSpeakerDiarizationConfig(
                       segmentation = OfflineSpeakerSegmentationModelConfig(
                           pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = "seg/model.onnx"),
                           numThreads = 2,
                       ),
-                      embedding = SpeakerEmbeddingExtractorConfig(model = "spk/embedding.onnx", numThreads = 2),
-                      clustering = FastClusteringConfig(numClusters = if (numSpeakers > 0) numSpeakers else -1, threshold = 0.5f),
-                      minDurationOn = 0.3f,
-                      minDurationOff = 0.5f,
+                      embedding = embCfg,
+                      clustering = FastClusteringConfig(
+                          numClusters = if (p.numSpeakers > 0) p.numSpeakers else -1,
+                          threshold = p.threshold,
+                      ),
+                      minDurationOn = 0.2f,
+                      minDurationOff = 0.3f,
                   )
                   val sd = OfflineSpeakerDiarization(ctx.assets, sdConfig)
                   val segments = try {
@@ -513,45 +563,52 @@ jobs:
                       sd.release()
                   }
 
-                  // Regroupe les segments consécutifs d'un même intervenant en "tours de parole".
-                  val turns = ArrayList<Turn>()
-                  for (s in segments.sortedBy { it.start }) {
-                      val last = turns.lastOrNull()
-                      if (last != null && last.speaker == s.speaker && s.start - last.end < 1.5f) {
-                          if (s.end > last.end) last.end = s.end
-                      } else {
-                          turns.add(Turn(s.start, s.end, s.speaker))
-                      }
-                  }
-                  if (turns.isEmpty()) turns.add(Turn(0f, totalSec, 0))
+                  // ---------- 2. Chronologie sans chevauchement ----------
+                  var turns = buildTimeline(segments.map { Triple(it.start, it.end, it.speaker) }, totalSec)
+                  if (turns.isEmpty()) turns = arrayListOf(Turn(0f, totalSec, 0))
 
-                  // Numérote les intervenants dans l'ordre d'apparition.
+                  // ---------- 3. Ré-attribution par empreinte vocale ----------
+                  status("Vérification des voix…", 35)
+                  val ext = SpeakerEmbeddingExtractor(ctx.assets, embCfg)
+                  try {
+                      for ((i, t) in turns.withIndex()) {
+                          if (t.dur >= MIN_EMB) t.emb = embedding(ext, samples, t.start, t.end)
+                          if (i % 10 == 0) status("Vérification des voix… ${i + 1}/${turns.size}", 35 + 5 * i / turns.size)
+                      }
+                  } finally {
+                      ext.release()
+                  }
+                  refine(turns, p.numSpeakers > 0)
+                  turns = mergeTurns(turns)
+                  padTurns(turns, totalSec)
+
                   val names = LinkedHashMap<Int, Int>()
                   for (t in turns) if (t.speaker !in names) names[t.speaker] = names.size + 1
 
-                  status("Chargement du modèle de transcription (peut prendre 30 s)…", 40)
+                  // ---------- 4. Transcription ----------
+                  status("Chargement de Canary…", 40)
                   val recConfig = OfflineRecognizerConfig(
-                      featConfig = FeatureConfig(sampleRate = SR, featureDim = 80),
+                      featConfig = FeatureConfig(sampleRate = SR, featureDim = 128),
                       modelConfig = OfflineModelConfig(
-                          transducer = OfflineTransducerModelConfig(
+                          canary = OfflineCanaryModelConfig(
                               encoder = "asr/encoder.int8.onnx",
                               decoder = "asr/decoder.int8.onnx",
-                              joiner = "asr/joiner.int8.onnx",
+                              srcLang = p.language,
+                              tgtLang = p.language,   // même langue = transcription, jamais de traduction
+                              usePnc = true,
                           ),
                           tokens = "asr/tokens.txt",
-                          modelType = "nemo_transducer",
                           numThreads = 4,
                       ),
                   )
                   val rec = OfflineRecognizer(ctx.assets, recConfig)
 
                   val sb = StringBuilder()
-                  sb.append("Transcription — ${names.size} intervenant(s) détecté(s) — durée ${fmt(totalSec)}\n\n")
+                  sb.append("Transcription — ${names.size} intervenant(s) — durée ${fmt(totalSec)}\n\n")
                   try {
                       for ((i, t) in turns.withIndex()) {
-                          val pct = 40 + 60 * i / turns.size
-                          status("Transcription… tour ${i + 1}/${turns.size}", pct)
-                          val text = transcribeRange(rec, samples, t.start, t.end)
+                          status("Transcription… tour ${i + 1}/${turns.size}", 40 + 60 * i / turns.size)
+                          val text = transcribeRange(rec, samples, t.start, t.end, p.windowSec)
                           if (text.isBlank()) continue
                           sb.append("[${fmt(t.start)} → ${fmt(t.end)}] Intervenant ${names[t.speaker]}\n")
                           sb.append(text).append("\n\n")
@@ -564,18 +621,146 @@ jobs:
                   return sb.toString().trimEnd() + "\n"
               }
 
-              /** Transcrit un intervalle en le découpant (sur des silences) en morceaux de 40 s maximum. */
-              private fun transcribeRange(rec: OfflineRecognizer, x: FloatArray, startS: Float, endS: Float): String {
+              /**
+               * Chaque trame de 10 ms est attribuée à UN seul intervenant. En cas de parole simultanée,
+               * le segment le plus court (l'interruption, le « oui », la relance) l'emporte :
+               * il n'est donc plus avalé dans le long tour de l'autre personne.
+               */
+              private fun buildTimeline(segs: List<Triple<Float, Float, Int>>, totalSec: Float): ArrayList<Turn> {
+                  val n = ceil(totalSec / FRAME).toInt() + 1
+                  val owner = IntArray(n) { -1 }
+                  val ownerLen = FloatArray(n) { Float.MAX_VALUE }
+                  for ((s, e, spk) in segs) {
+                      val len = e - s
+                      val a = (s / FRAME).toInt().coerceIn(0, n - 1)
+                      val b = (e / FRAME).toInt().coerceIn(0, n)
+                      for (f in a until b) if (len < ownerLen[f]) { owner[f] = spk; ownerLen[f] = len }
+                  }
+                  val runs = ArrayList<Turn>()
+                  var f = 0
+                  while (f < n) {
+                      if (owner[f] < 0) { f++; continue }
+                      val spk = owner[f]
+                      val a = f
+                      while (f < n && owner[f] == spk) f++
+                      runs.add(Turn(a * FRAME, f * FRAME, spk))
+                  }
+                  return mergeTurns(runs).filterTo(ArrayList()) { it.dur >= MIN_TURN }
+              }
+
+              /** Fusionne deux tours consécutifs du même intervenant séparés par un court silence. */
+              private fun mergeTurns(src: List<Turn>): ArrayList<Turn> {
+                  val out = ArrayList<Turn>()
+                  for (t in src.sortedBy { it.start }) {
+                      val last = out.lastOrNull()
+                      if (last != null && last.speaker == t.speaker && t.start - last.end <= MERGE_GAP) {
+                          last.end = max(last.end, t.end)
+                          last.emb = null
+                      } else out.add(t)
+                  }
+                  return out
+              }
+
+              /** Recalcule les centroïdes vocaux et réattribue chaque tour à la voix la plus proche. */
+              private fun refine(turns: List<Turn>, fixedCount: Boolean) {
+                  repeat(3) {
+                      val cents = centroids(turns)
+                      if (cents.size < 2) return
+                      if (!fixedCount) {
+                          // Deux « intervenants » à la voix quasi identique = une seule personne.
+                          val ids = cents.keys.toList()
+                          for (i in ids.indices) for (j in i + 1 until ids.size) {
+                              val a = cents[ids[i]] ?: continue
+                              val b = cents[ids[j]] ?: continue
+                              if (dot(a, b) > 0.80f) {
+                                  for (t in turns) if (t.speaker == ids[j]) t.speaker = ids[i]
+                                  cents.remove(ids[j])
+                              }
+                          }
+                          // Un intervenant qui ne parle que < 2 % du temps est souvent une erreur : on le rattache.
+                          val total = turns.sumOf { it.dur.toDouble() }
+                          for (id in cents.keys.toList()) {
+                              val d = turns.filter { it.speaker == id }.sumOf { it.dur.toDouble() }
+                              if (cents.size > 2 && d < 0.02 * total && d < 5.0) {
+                                  val c = cents.remove(id)!!
+                                  val best = cents.maxByOrNull { dot(it.value, c) }!!.key
+                                  for (t in turns) if (t.speaker == id) t.speaker = best
+                              }
+                          }
+                      }
+                      for (t in turns) {
+                          val e = t.emb ?: continue
+                          val best = cents.maxByOrNull { dot(it.value, e) } ?: continue
+                          t.speaker = best.key
+                      }
+                  }
+              }
+
+              private fun centroids(turns: List<Turn>): HashMap<Int, FloatArray> {
+                  val acc = HashMap<Int, FloatArray>()
+                  for (t in turns) {
+                      val e = t.emb ?: continue
+                      val c = acc.getOrPut(t.speaker) { FloatArray(e.size) }
+                      val w = min(t.dur, 15f)
+                      for (k in e.indices) c[k] += e[k] * w
+                  }
+                  for (c in acc.values) normalize(c)
+                  return acc
+              }
+
+              /** Petite marge (100 ms avant, 150 ms après) sans jamais empiéter sur le tour voisin. */
+              private fun padTurns(turns: List<Turn>, totalSec: Float) {
+                  for ((i, t) in turns.withIndex()) {
+                      val prevEnd = if (i > 0) turns[i - 1].end else 0f
+                      val nextStart = if (i < turns.size - 1) turns[i + 1].start else totalSec
+                      t.start = max(prevEnd, t.start - 0.10f).coerceAtLeast(0f)
+                      t.end = min(nextStart, t.end + 0.15f).coerceAtMost(totalSec)
+                  }
+              }
+
+              private fun embedding(ext: SpeakerEmbeddingExtractor, x: FloatArray, s: Float, e: Float): FloatArray? {
+                  // Au plus 10 s prises au centre du tour.
+                  val mid = (s + e) / 2
+                  val half = min((e - s) / 2, 5f)
+                  val a = ((mid - half) * SR).toInt().coerceIn(0, x.size)
+                  val b = ((mid + half) * SR).toInt().coerceIn(a, x.size)
+                  if (b - a < SR / 2) return null
+                  val stream = ext.createStream()
+                  return try {
+                      stream.acceptWaveform(x.copyOfRange(a, b), SR)
+                      stream.inputFinished()
+                      if (ext.isReady(stream)) normalize(ext.compute(stream)) else null
+                  } finally {
+                      stream.release()
+                  }
+              }
+
+              private fun normalize(v: FloatArray): FloatArray {
+                  var n = 0f
+                  for (x in v) n += x * x
+                  n = sqrt(n)
+                  if (n > 0f) for (k in v.indices) v[k] /= n
+                  return v
+              }
+
+              private fun dot(a: FloatArray, b: FloatArray): Float {
+                  var s = 0f
+                  for (k in a.indices) s += a[k] * b[k]
+                  return s
+              }
+
+              /** Transcrit un tour en morceaux de [window] secondes au plus, coupés sur le passage le plus silencieux. */
+              private fun transcribeRange(rec: OfflineRecognizer, x: FloatArray, startS: Float, endS: Float, window: Float): String {
                   var a = (startS * SR).toInt().coerceIn(0, x.size)
                   val b = (endS * SR).toInt().coerceIn(0, x.size)
+                  val win = (window * SR).toInt()
                   val parts = ArrayList<String>()
                   while (b - a > (0.2f * SR)) {
                       var cut = b
-                      if (b - a > MAX_CHUNK_S * SR) cut = quietestPoint(x, a + 25 * SR, a + (MAX_CHUNK_S * SR).toInt())
-                      val chunk = x.copyOfRange(a, cut)
+                      if (b - a > win) cut = quietestPoint(x, a + (win * 0.65f).toInt(), a + win)
                       val stream = rec.createStream()
                       try {
-                          stream.acceptWaveform(chunk, SR)
+                          stream.acceptWaveform(x.copyOfRange(a, cut), SR)
                           rec.decode(stream)
                           val txt = rec.getResult(stream).text.trim()
                           if (txt.isNotEmpty()) parts.add(txt)
@@ -587,7 +772,6 @@ jobs:
                   return parts.joinToString(" ")
               }
 
-              /** Point de plus faible énergie (fenêtres de 100 ms) entre lo et hi. */
               private fun quietestPoint(x: FloatArray, lo: Int, hi: Int): Int {
                   val win = SR / 10
                   var best = hi
@@ -596,8 +780,7 @@ jobs:
                   while (p + win <= hi && p + win <= x.size) {
                       var e = 0.0
                       for (k in p until p + win) e += x[k] * x[k]
-                      val rms = sqrt(e / win)
-                      if (rms < bestE) { bestE = rms; best = p + win / 2 }
+                      if (e < bestE) { bestE = e; best = p + win / 2 }
                       p += win / 2
                   }
                   return best
@@ -639,14 +822,99 @@ jobs:
                   android:layout_height="wrap_content"
                   android:text="Aucun fichier sélectionné" />
 
-              <EditText
-                  android:id="@+id/edSpeakers"
+              <LinearLayout
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:hint="Nombre d'intervenants (vide = automatique)"
-                  android:layout_marginTop="8dp"
-                  android:inputType="number"
-                  android:maxLength="2" />
+                  android:layout_marginTop="4dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="150dp"
+                      android:layout_height="wrap_content"
+                      android:text="Langue parlée" />
+
+                  <Spinner
+                      android:id="@+id/spLang"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1" />
+
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="150dp"
+                      android:layout_height="wrap_content"
+                      android:text="Intervenants" />
+
+                  <EditText
+                      android:id="@+id/edSpeakers"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:hint="vide = automatique"
+                      android:inputType="number"
+                      android:maxLength="4"
+                      android:text="" />
+
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="150dp"
+                      android:layout_height="wrap_content"
+                      android:text="Séparation des voix" />
+
+                  <Spinner
+                      android:id="@+id/spSep"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1" />
+
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="150dp"
+                      android:layout_height="wrap_content"
+                      android:text="Fenêtre (secondes)" />
+
+                  <EditText
+                      android:id="@+id/edWindow"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:hint="28"
+                      android:inputType="number"
+                      android:maxLength="4"
+                      android:text="28" />
+
+              </LinearLayout>
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Conseil : indiquer le nombre exact d'intervenants donne la meilleure séparation. Fenêtre : 5 à 40 s."
+                  android:textSize="12sp" />
 
               <Button
                   android:id="@+id/btnRun"
@@ -761,19 +1029,18 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a
           cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so app/src/main/jniLibs/arm64-v8a/
 
-      - name: Modèles (Parakeet TDT 0.6B v3, pyannote, WeSpeaker)
+      - name: Modèles (Canary 180M Flash, pyannote, TitaNet-Large)
         run: |
           set -e
           A=app/src/main/assets
           mkdir -p $A/asr $A/seg $A/spk
           R=https://github.com/k2-fsa/sherpa-onnx/releases/download
-          P=sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
-          curl -sSfL $R/asr-models/$P.tar.bz2 | tar xjf - -C /tmp
-          cp /tmp/$P/encoder.int8.onnx /tmp/$P/decoder.int8.onnx /tmp/$P/joiner.int8.onnx /tmp/$P/tokens.txt $A/asr/
-          rm -rf /tmp/$P
+          C=sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8
+          curl -sSfL $R/asr-models/$C.tar.bz2 | tar xjf - -C /tmp
+          cp /tmp/$C/encoder.int8.onnx /tmp/$C/decoder.int8.onnx /tmp/$C/tokens.txt $A/asr/
           curl -sSfL $R/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xjf - -C /tmp
           cp /tmp/sherpa-onnx-pyannote-segmentation-3-0/model.onnx $A/seg/model.onnx
-          curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+          curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/nemo_en_titanet_large.onnx
           du -sh $A/*
 
       - name: Compiler l'APK
@@ -786,5 +1053,5 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk Transcripteur.apk
           ls -lh Transcripteur.apk
           gh release create "build-${{ github.run_number }}" Transcripteur.apk \
-            --title "Transcripteur Parakeet – build ${{ github.run_number }}" \
-            --notes "Désinstallez l'ancienne version avant d'installer celle-ci. Transcription (Parakeet TDT 0.6B v3) + séparation des intervenants, 100 % hors ligne, Android arm64."
+            --title "Transcripteur Canary – build ${{ github.run_number }}" \
+            --notes "Désinstallez l'ancienne version avant d'installer celle-ci. Transcription (NVIDIA Canary 180M Flash : fr, en, es, de) + séparation des intervenants, 100 % hors ligne, Android arm64."
