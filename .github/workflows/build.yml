@@ -263,6 +263,8 @@ jobs:
           cat > 'app/src/main/java/fr/transcripteur/MainActivity.kt' <<'EOF_FILE'
           package fr.transcripteur
 
+          import android.app.ActivityManager
+          import android.app.ApplicationExitInfo
           import android.content.ClipData
           import android.content.ClipboardManager
           import android.content.Intent
@@ -294,9 +296,9 @@ jobs:
 
               // Seuil de clustering : plus petit = sépare davantage les voix
               private val separations = listOf(
-                  "Normale" to 0.45f,
+                  "Normale" to 0.40f,
                   "Forte (voix proches)" to 0.30f,
-                  "Faible (trop d'intervenants)" to 0.60f,
+                  "Faible (trop d'intervenants)" to 0.55f,
               )
 
               private var audioUri: Uri? = null
@@ -379,6 +381,46 @@ jobs:
                   btnSave.setOnClickListener { saveTxt.launch("$audioName.txt") }
 
                   handleIntent(intent)
+                  reportPreviousCrash()
+              }
+
+              private val prefs by lazy { getSharedPreferences("etat", MODE_PRIVATE) }
+              private var lastStep = ""
+
+              /** Mémorise l'étape en cours (écriture synchrone) pour savoir où un arrêt brutal a eu lieu. */
+              private fun recordStep(msg: String) {
+                  val step = msg.substringBefore("…").trim()
+                  if (step != lastStep) {
+                      lastStep = step
+                      prefs.edit().putString("etape", step).putBoolean("en_cours", busy).commit()
+                  }
+              }
+
+              /** Au démarrage : si la dernière analyse a été interrompue, affiche l'étape et la raison donnée par Android. */
+              private fun reportPreviousCrash() {
+                  if (!prefs.getBoolean("en_cours", false)) return
+                  val step = prefs.getString("etape", "?")
+                  prefs.edit().putBoolean("en_cours", false).commit()
+                  var reason = "raison inconnue"
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      try {
+                          val am = getSystemService(ActivityManager::class.java)
+                          val info = am?.getHistoricalProcessExitReasons(packageName, 0, 1)?.firstOrNull()
+                          if (info != null) {
+                              reason = when (info.reason) {
+                                  ApplicationExitInfo.REASON_LOW_MEMORY -> "mémoire du téléphone insuffisante"
+                                  ApplicationExitInfo.REASON_CRASH_NATIVE -> "plantage du moteur de calcul"
+                                  ApplicationExitInfo.REASON_CRASH -> "erreur de l'application"
+                                  ApplicationExitInfo.REASON_ANR -> "application bloquée"
+                                  ApplicationExitInfo.REASON_SIGNALED -> "arrêtée par le système"
+                                  ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "consommation excessive"
+                                  ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED -> "fermée manuellement"
+                                  else -> "code ${info.reason}"
+                              } + (info.description?.let { " ($it)" } ?: "") + ", mémoire utilisée ${info.pss / 1024} Mo"
+                          }
+                      } catch (_: Exception) { }
+                  }
+                  txtStatus.text = "⚠ La dernière analyse s'est arrêtée à l'étape « $step » : $reason."
               }
 
               override fun onNewIntent(intent: Intent) {
@@ -437,7 +479,7 @@ jobs:
                           val result = withContext(Dispatchers.Default) {
                               Transcriber.run(
                                   this@MainActivity, uri, params,
-                                  status = { msg, p -> runOnUiThread { txtStatus.text = msg; progress.progress = p } },
+                                  status = { msg, p -> recordStep(msg); runOnUiThread { txtStatus.text = msg; progress.progress = p } },
                                   partial = { txt -> runOnUiThread { txtResult.text = txt } },
                               )
                           }
@@ -448,6 +490,8 @@ jobs:
                           if (t is OutOfMemoryError) txtStatus.append("\nFichier trop long pour la mémoire du téléphone : découpez-le.")
                       } finally {
                           busy = false
+                          prefs.edit().putBoolean("en_cours", false).commit()
+                          lastStep = ""
                           window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                           setButtons(true)
                       }
@@ -511,7 +555,7 @@ jobs:
           /**
            * Pipeline 100 % hors ligne :
            * 1) décodage audio -> 16 kHz mono
-           * 2) diarisation pyannote 3.0 + TitaNet-Large
+           * 2) diarisation pyannote 3.0 + WeSpeaker ResNet34
            * 3) chronologie sans chevauchement : un instant = un seul intervenant
            * 4) ré-attribution de chaque tour par empreinte vocale (centroïdes)
            * 5) transcription de chaque tour avec NVIDIA Canary 180M Flash, langue imposée
@@ -1029,7 +1073,7 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a
           cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so app/src/main/jniLibs/arm64-v8a/
 
-      - name: Modèles (Canary 180M Flash, pyannote, TitaNet-Large)
+      - name: Modèles (Canary 180M Flash, pyannote, WeSpeaker)
         run: |
           set -e
           A=app/src/main/assets
@@ -1040,7 +1084,7 @@ jobs:
           cp /tmp/$C/encoder.int8.onnx /tmp/$C/decoder.int8.onnx /tmp/$C/tokens.txt $A/asr/
           curl -sSfL $R/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xjf - -C /tmp
           cp /tmp/sherpa-onnx-pyannote-segmentation-3-0/model.onnx $A/seg/model.onnx
-          curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/nemo_en_titanet_large.onnx
+          curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
           du -sh $A/*
 
       - name: Compiler l'APK
