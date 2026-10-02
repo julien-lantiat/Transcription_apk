@@ -271,11 +271,9 @@ jobs:
           import android.os.Bundle
           import android.provider.OpenableColumns
           import android.view.WindowManager
-          import android.widget.ArrayAdapter
           import android.widget.Button
           import android.widget.EditText
           import android.widget.ProgressBar
-          import android.widget.Spinner
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
@@ -288,11 +286,6 @@ jobs:
           import kotlinx.coroutines.withContext
 
           class MainActivity : AppCompatActivity() {
-
-              private val languages = listOf(
-                  "Français" to "fr", "Anglais" to "en", "Espagnol" to "es", "Allemand" to "de",
-                  "Italien" to "it", "Portugais" to "pt", "Arabe" to "ar", "Détection automatique" to "",
-              )
 
               private var audioUri: Uri? = null
               private var audioName = "transcription"
@@ -307,7 +300,6 @@ jobs:
               private lateinit var txtFile: TextView
               private lateinit var txtStatus: TextView
               private lateinit var txtResult: TextView
-              private lateinit var spLang: Spinner
               private lateinit var edSpeakers: EditText
               private lateinit var progress: ProgressBar
 
@@ -346,11 +338,8 @@ jobs:
                   txtFile = findViewById(R.id.txtFile)
                   txtStatus = findViewById(R.id.txtStatus)
                   txtResult = findViewById(R.id.txtResult)
-                  spLang = findViewById(R.id.spLang)
                   edSpeakers = findViewById(R.id.edSpeakers)
                   progress = findViewById(R.id.progress)
-
-                  spLang.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, languages.map { it.first })
 
                   btnPick.setOnClickListener { pickAudio.launch(arrayOf("audio/*")) }
                   btnRun.setOnClickListener { startTranscription() }
@@ -407,7 +396,6 @@ jobs:
 
               private fun startTranscription() {
                   val uri = audioUri ?: return
-                  val lang = languages[spLang.selectedItemPosition].second
                   val n = edSpeakers.text.toString().toIntOrNull() ?: 0
 
                   busy = true
@@ -420,7 +408,7 @@ jobs:
                       try {
                           val result = withContext(Dispatchers.Default) {
                               Transcriber.run(
-                                  this@MainActivity, uri, lang, n,
+                                  this@MainActivity, uri, n,
                                   status = { msg, p -> runOnUiThread { txtStatus.text = msg; progress.progress = p } },
                                   partial = { txt -> runOnUiThread { txtResult.text = txt } },
                               )
@@ -465,7 +453,7 @@ jobs:
           import com.k2fsa.sherpa.onnx.OfflineSpeakerDiarizationConfig
           import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationModelConfig
           import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
-          import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
+          import com.k2fsa.sherpa.onnx.OfflineTransducerModelConfig
           import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
           import kotlin.math.sqrt
 
@@ -473,7 +461,7 @@ jobs:
            * Pipeline 100 % hors ligne :
            * 1) décodage audio -> 16 kHz mono
            * 2) diarisation (pyannote segmentation 3.0 + embeddings WeSpeaker + clustering)
-           * 3) transcription de chaque tour de parole avec Whisper (base, int8)
+           * 3) transcription de chaque tour de parole avec NVIDIA Parakeet TDT 0.6B v3 (int8, 25 langues)
            */
           /**
            * Rappel de progression appelé par le code natif.
@@ -491,14 +479,13 @@ jobs:
 
           object Transcriber {
               const val SR = 16000
-              private const val MAX_CHUNK_S = 28f   // Whisper traite au plus 30 s par passe
+              private const val MAX_CHUNK_S = 40f   // morceaux de 40 s max, coupés sur un silence
 
               private class Turn(val start: Float, var end: Float, val speaker: Int)
 
               fun run(
                   ctx: Context,
                   uri: Uri,
-                  language: String,
                   numSpeakers: Int,      // <= 0 : détection automatique
                   status: (String, Int) -> Unit,
                   partial: (String) -> Unit,
@@ -542,18 +529,17 @@ jobs:
                   val names = LinkedHashMap<Int, Int>()
                   for (t in turns) if (t.speaker !in names) names[t.speaker] = names.size + 1
 
-                  status("Chargement de Whisper…", 40)
+                  status("Chargement du modèle de transcription (peut prendre 30 s)…", 40)
                   val recConfig = OfflineRecognizerConfig(
                       featConfig = FeatureConfig(sampleRate = SR, featureDim = 80),
                       modelConfig = OfflineModelConfig(
-                          whisper = OfflineWhisperModelConfig(
-                              encoder = "whisper/base-encoder.int8.onnx",
-                              decoder = "whisper/base-decoder.int8.onnx",
-                              language = language,
-                              task = "transcribe",
+                          transducer = OfflineTransducerModelConfig(
+                              encoder = "asr/encoder.int8.onnx",
+                              decoder = "asr/decoder.int8.onnx",
+                              joiner = "asr/joiner.int8.onnx",
                           ),
-                          tokens = "whisper/base-tokens.txt",
-                          modelType = "whisper",
+                          tokens = "asr/tokens.txt",
+                          modelType = "nemo_transducer",
                           numThreads = 4,
                       ),
                   )
@@ -578,14 +564,14 @@ jobs:
                   return sb.toString().trimEnd() + "\n"
               }
 
-              /** Transcrit un intervalle en le découpant (sur des silences) en morceaux de moins de 28 s. */
+              /** Transcrit un intervalle en le découpant (sur des silences) en morceaux de 40 s maximum. */
               private fun transcribeRange(rec: OfflineRecognizer, x: FloatArray, startS: Float, endS: Float): String {
                   var a = (startS * SR).toInt().coerceIn(0, x.size)
                   val b = (endS * SR).toInt().coerceIn(0, x.size)
                   val parts = ArrayList<String>()
-                  while (b - a > (0.3f * SR)) {
+                  while (b - a > (0.2f * SR)) {
                       var cut = b
-                      if (b - a > MAX_CHUNK_S * SR) cut = quietestPoint(x, a + 18 * SR, a + (MAX_CHUNK_S * SR).toInt())
+                      if (b - a > MAX_CHUNK_S * SR) cut = quietestPoint(x, a + 25 * SR, a + (MAX_CHUNK_S * SR).toInt())
                       val chunk = x.copyOfRange(a, cut)
                       val stream = rec.createStream()
                       try {
@@ -653,30 +639,12 @@ jobs:
                   android:layout_height="wrap_content"
                   android:text="Aucun fichier sélectionné" />
 
-              <LinearLayout
-                  android:layout_width="match_parent"
-                  android:layout_height="wrap_content"
-                  android:layout_marginTop="8dp"
-                  android:gravity="center_vertical"
-                  android:orientation="horizontal">
-
-                  <TextView
-                      android:layout_width="wrap_content"
-                      android:layout_height="wrap_content"
-                      android:text="Langue : " />
-
-                  <Spinner
-                      android:id="@+id/spLang"
-                      android:layout_width="0dp"
-                      android:layout_height="wrap_content"
-                      android:layout_weight="1" />
-              </LinearLayout>
-
               <EditText
                   android:id="@+id/edSpeakers"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
                   android:hint="Nombre d'intervenants (vide = automatique)"
+                  android:layout_marginTop="8dp"
                   android:inputType="number"
                   android:maxLength="2" />
 
@@ -793,14 +761,16 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a
           cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so app/src/main/jniLibs/arm64-v8a/
 
-      - name: Modèles (Whisper base, pyannote, WeSpeaker)
+      - name: Modèles (Parakeet TDT 0.6B v3, pyannote, WeSpeaker)
         run: |
           set -e
           A=app/src/main/assets
-          mkdir -p $A/whisper $A/seg $A/spk
+          mkdir -p $A/asr $A/seg $A/spk
           R=https://github.com/k2-fsa/sherpa-onnx/releases/download
-          curl -sSfL $R/asr-models/sherpa-onnx-whisper-base.tar.bz2 | tar xjf - -C /tmp
-          cp /tmp/sherpa-onnx-whisper-base/base-encoder.int8.onnx /tmp/sherpa-onnx-whisper-base/base-decoder.int8.onnx /tmp/sherpa-onnx-whisper-base/base-tokens.txt $A/whisper/
+          P=sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
+          curl -sSfL $R/asr-models/$P.tar.bz2 | tar xjf - -C /tmp
+          cp /tmp/$P/encoder.int8.onnx /tmp/$P/decoder.int8.onnx /tmp/$P/joiner.int8.onnx /tmp/$P/tokens.txt $A/asr/
+          rm -rf /tmp/$P
           curl -sSfL $R/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xjf - -C /tmp
           cp /tmp/sherpa-onnx-pyannote-segmentation-3-0/model.onnx $A/seg/model.onnx
           curl -sSfL -o $A/spk/embedding.onnx $R/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
@@ -814,11 +784,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp app/build/outputs/apk/release/app-release.apk Transcripteur.apk
+          ls -lh Transcripteur.apk
           gh release create "build-${{ github.run_number }}" Transcripteur.apk \
-            --title "Transcripteur – build ${{ github.run_number }}" \
-            --notes "Désinstallez l'ancienne version avant d'installer celle-ci. APK à installer sur Android (arm64). Transcription + séparation des intervenants, 100 % hors ligne."
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Transcripteur-apk
-          path: Transcripteur.apk
+            --title "Transcripteur Parakeet – build ${{ github.run_number }}" \
+            --notes "Désinstallez l'ancienne version avant d'installer celle-ci. Transcription (Parakeet TDT 0.6B v3) + séparation des intervenants, 100 % hors ligne, Android arm64."
